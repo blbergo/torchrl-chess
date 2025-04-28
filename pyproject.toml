@@ -1,0 +1,25 @@
+[project]
+name = "assignment-2"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "blbergo"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "chess (>=1.11.2,<2.0.0)",
+    "ipykernel (>=6.29.5,<7.0.0)",
+    "pandas (>=2.2.3,<3.0.0)",
+    "torchrl (>=0.7.2,<0.8.0)",
+    "plotly (>=6.0.1,<7.0.0)",
+    "nbformat (>=5.10.4,<6.0.0)",
+    "random-word (>=1.0.13,<2.0.0)",
+]
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
