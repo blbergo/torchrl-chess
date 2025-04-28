@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime
 from random_word import RandomWords
 import os
-from torchrl.objectives import PPOLoss
+from torchrl.objectives import PPOLoss, KLPENPPOLoss, ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torch.optim import Adam
 from tensordict.nn import TensorDictModule
@@ -24,6 +24,7 @@ class Model():
         
         self.env = ChessEnv(include_san=True, include_legal_moves=True)
         n_obs = self.env.observation_spec["legal_moves"].shape[0]
+    
         n_actions = self.env.action_spec.n
         
         print(f"observation shape: {n_obs}, action space: {n_actions}")
@@ -56,25 +57,25 @@ class Model():
         )
 
         self.policy = ActorCriticWrapper(
-            policy_operator=self.actor,
-            value_operator=self.critic,
+            self.actor,
+            self.critic,
         )
         
-        self.loss_fn = PPOLoss(
-            actor_network=self.policy.get_policy_operator(),
-            critic_network=self.policy.get_value_operator(),
+        self.loss_fn = ClipPPOLoss(
+            actor_network=self.actor,
+            critic_network=self.critic,
             value_loss_coef=value_loss_coef,
             entropy_coef=entropy_coef,
         )
 
         self.advantage = GAE(
-            value_network=self.policy.get_value_operator(),
+            value_network=self.critic,
             gamma=gamma,
             lmbda=lmda,
         )
-
+        
         self.optimizer = Adam(
-            list(self.policy.parameters()) + list(self.critic.parameters()),
+            self.actor.parameters(),
             lr=lr,
         )
         
@@ -87,11 +88,8 @@ class Model():
                     file.unlink()
             
             path.mkdir(parents=True, exist_ok=True)
-            self.log_files.append(open(f"{dir}/logs.csv", "a"))
+            self.log_files.append(open(f"{dir}/logs.csv", "w"))
             self.log_files[-1].write("episode,loss,loss_type\n")
-            
-        for log_file in self.log_files:
-            log_file.write("episode,loss,loss_type\n")
     
     def _log(self, data):
         for log_file in self.log_files:
@@ -136,16 +134,9 @@ class Model():
                 policy=self.policy,
                 max_steps=max_steps_per_episode,
             )
+ 
+            self.advantage(rollout.exclude("state_value"))
             
-            rollout = rollout.select(
-                "next",
-                "legal_moves",
-                "done",
-                "action",
-                "action_mask",
-                "sample_log_prob",
-            )
-            self.advantage(rollout)
             # detach sample_log_prob
             rollout["sample_log_prob"].detach_()
             loss = self.loss_fn(rollout)
@@ -156,9 +147,11 @@ class Model():
                 total_loss += v
             self._flush_logs()
                 
+            # Update the model
             self.optimizer.zero_grad()
             total_loss.backward()
             self.optimizer.step()
+            
             print(f"Episode {episode + 1}/{episodes} - Loss: {total_loss.item():.4f}")
             
             # Save the model
