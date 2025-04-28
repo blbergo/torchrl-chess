@@ -9,6 +9,7 @@ from torchrl.objectives import PPOLoss, KLPENPPOLoss, ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torch.optim import Adam
 from tensordict.nn import TensorDictModule
+from torchrl.collectors import SyncDataCollector
 from torchrl.modules import ValueOperator, ProbabilisticActor, ActorCriticWrapper
 from actor import ChessActor
 from critic import ChessCritic
@@ -16,6 +17,7 @@ from torchrl.modules import MaskedCategorical
 import torch
 from torchrl.envs import ChessEnv
 from pathlib import Path
+import numpy as np
 
 class Model():
     def __init__(self, value_loss_coef=0.5, entropy_coef=0.2, gamma=0.99, lmda=0.95, lr=1e-4):
@@ -61,11 +63,11 @@ class Model():
             self.critic,
         )
         
-        self.loss_fn = ClipPPOLoss(
+        self.loss_fn = PPOLoss(
             actor_network=self.actor,
             critic_network=self.critic,
-            value_loss_coef=value_loss_coef,
             entropy_coef=entropy_coef,
+            critic_coef=value_loss_coef,
         )
 
         self.advantage = GAE(
@@ -75,7 +77,7 @@ class Model():
         )
         
         self.optimizer = Adam(
-            self.actor.parameters(),
+            self.loss_fn.parameters(),
             lr=lr,
         )
         
@@ -104,8 +106,8 @@ class Model():
         for log_file in self.log_files:
             log_file.close()
     
-    def train(self, episodes=100, max_steps_per_episode=1000, save_rate=0.1):
-        save_interval = int(episodes * save_rate)
+    def fit(self, episodes=100, max_steps_per_episode=1000, save_rate=0.1):
+        save_interval = max(np.floor(episodes * save_rate), 1)
         save_date = datetime.now().strftime("%Y%m%d%H%M%S")
 
         random_word = RandomWords()
@@ -122,66 +124,57 @@ class Model():
             for file in latest_path.glob("*"):
                 if file.is_file():
                     file.unlink()
+                    
         except Exception as e:
             print(f"Error creating directories: {e}")
             exit(1)
             
         self.log_file_dirs.append(f"./runs/previous/{salted_model_name}")
         self._init_logs()
-
-        for episode in range(episodes):
-            rollout = self.env.rollout(
-                policy=self.policy,
-                max_steps=max_steps_per_episode,
-            )
- 
-            self.advantage(rollout.exclude("state_value"))
-            
-            # detach sample_log_prob
-            rollout["sample_log_prob"].detach_()
-            loss = self.loss_fn(rollout)
-            
-            total_loss = 0
-            for k, v in loss.items():
-                self._log(f"{episode},{v.item()},{k}\n")
-                total_loss += v
-            self._flush_logs()
-                
-            # Update the model
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            self.optimizer.step()
-            
-            print(f"Episode {episode + 1}/{episodes} - Loss: {total_loss.item():.4f}")
-            
-            # Save the model
-            if episode % save_interval == 0:
-                torch.save(
-                    {
-                        "actor_state_dict": self.actor.state_dict(),
-                        "critic_state_dict": self.critic.state_dict(),
-                    },
-                    f"./runs/latest/model_{episode + save_interval}.pth",
-                )
-
-        self._close_logs()
-        # Save the model at the end   
-        torch.save(
-            {
-                "actor_state_dict": self.actor.state_dict(),
-                "critic_state_dict": self.critic.state_dict(),
-            },
-            f"./runs/previous/{salted_model_name}/model.pth",
+        
+        # Initialize the data collector
+        collector = SyncDataCollector(
+            self.env,
+            self.policy,
+            total_frames=episodes * max_steps_per_episode,
+            frames_per_batch=max_steps_per_episode,
         )
         
-        torch.save(
-            {
-                "actor_state_dict": self.actor.state_dict(),
-                "critic_state_dict": self.critic.state_dict(),
-            },
-            f"./runs/latest/model.pth",
-        )      
+        print("Starting training...")
         
+        for episode, data in enumerate(collector):
+            self.advantage(data.exclude("state_value"))
+                    
+            total_loss = 0
+            loss = self.loss_fn(data)
+            for k, v in loss.items():
+                if "loss" in k:
+                    total_loss += v
+                    self._log(f"{episode},{v.item()},{k}\n")
+            self._flush_logs()
+            
+            print(f"Loss: {total_loss.item()}")
+            total_loss.backward()
+            
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            
+            if episode % save_interval == 0:
+                # Save the model
+                torch.save({
+                    "actor_state_dict": self.actor.state_dict(),
+                    "critic_state_dict": self.critic.state_dict(),
+                }, f"./runs/previous/{salted_model_name}/model_{episode}.pth")
+                
+                # Save the latest model
+                torch.save({
+                    "actor_state_dict": self.actor.state_dict(),
+                    "critic_state_dict": self.critic.state_dict(),
+                }, f"./runs/latest/model.pth")
+                
+        self._close_logs()
+            
+
     def load(self, path: str):
         if not os.path.exists(path):
             print(f"Model file {path} does not exist.")
