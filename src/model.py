@@ -1,41 +1,39 @@
-
-from typing import Tuple
 import torch
 from pathlib import Path
 from datetime import datetime
 from random_word import RandomWords
 import os
-from torchrl.objectives import PPOLoss, KLPENPPOLoss, ClipPPOLoss
+from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torch.optim import Adam
 from tensordict.nn import TensorDictModule
 from torchrl.collectors import SyncDataCollector
-from torchrl.modules import ValueOperator, ProbabilisticActor, ActorCriticWrapper
+from torchrl.modules import ValueOperator, ProbabilisticActor, ActorCriticWrapper, MultiAgentMLP
 from actor import ChessActor
 from critic import ChessCritic
 from torchrl.modules import MaskedCategorical
 import torch
-from torchrl.envs import ChessEnv
 from pathlib import Path
 import numpy as np
+from env import ChessEnv
 
 class Model():
-    def __init__(self, value_loss_coef=0.5, entropy_coef=0.2, gamma=0.99, lmda=0.95, lr=1e-4):
+    def __init__(self, entropy_coef=1e-4, critic_coef=1.0, clip_epsilon=0.2, gamma=0.99, lmda=0.95, lr=3e-4):
         self.log_file_dirs = ["./runs/latest"]
         self.log_files = []
         
-        self.env = ChessEnv(include_san=True, include_legal_moves=True)
-        n_obs = self.env.observation_spec["legal_moves"].shape[0]
+        self.env = ChessEnv(include_legal_moves=True, include_hash=True, include_fen=True)
+        n_obs = self.env.observation_spec["fen_hash"].shape[0]
     
         n_actions = self.env.action_spec.n
         
         print(f"observation shape: {n_obs}, action space: {n_actions}")
-
+        
         actor_net = ChessActor(n_obs, n_actions)
 
         actor_mod = TensorDictModule(
             module=actor_net,
-            in_keys=["legal_moves"],
+            in_keys=["fen_hash"],
             out_keys=["logits"],
         )
 
@@ -49,25 +47,23 @@ class Model():
             distribution_class=MaskedCategorical,   # applies the mask under the hood
             return_log_prob=True,                  # returns log_prob
         )
-
+   
         critic_net = ChessCritic(n_obs)
 
         self.critic = ValueOperator(
             module=critic_net,
-            in_keys=["legal_moves"],
+            in_keys=["fen_hash"],
             out_keys=["state_value"],
         )
 
-        self.policy = ActorCriticWrapper(
-            self.actor,
-            self.critic,
-        )
-        
-        self.loss_fn = PPOLoss(
+        self.loss_fn = ClipPPOLoss(
             actor_network=self.actor,
             critic_network=self.critic,
             entropy_coef=entropy_coef,
-            critic_coef=value_loss_coef,
+            entropy_bonus=True,
+            clip_epsilon=clip_epsilon,
+            critic_coef=critic_coef,
+            normalize_advantage=True,
         )
 
         self.advantage = GAE(
@@ -91,7 +87,7 @@ class Model():
             
             path.mkdir(parents=True, exist_ok=True)
             self.log_files.append(open(f"{dir}/logs.csv", "w"))
-            self.log_files[-1].write("episode,loss,loss_type\n")
+            self.log_files[-1].write("episode,epoch,reward,loss\n")
     
     def _log(self, data):
         for log_file in self.log_files:
@@ -106,7 +102,7 @@ class Model():
         for log_file in self.log_files:
             log_file.close()
     
-    def fit(self, episodes=100, max_steps_per_episode=1000, save_rate=0.1):
+    def fit(self, episodes=100, max_steps_per_episode=1000, save_rate=0.1, epochs_per_episode=1):
         save_interval = max(np.floor(episodes * save_rate), 1)
         save_date = datetime.now().strftime("%Y%m%d%H%M%S")
 
@@ -135,42 +131,49 @@ class Model():
         # Initialize the data collector
         collector = SyncDataCollector(
             self.env,
-            self.policy,
+            self.actor,
             total_frames=episodes * max_steps_per_episode,
             frames_per_batch=max_steps_per_episode,
+        )
+        
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, episodes, 0.0
         )
         
         print("Starting training...")
         
         for episode, data in enumerate(collector):
-            self.advantage(data.exclude("state_value"))
-                    
-            total_loss = 0
-            loss = self.loss_fn(data)
-            for k, v in loss.items():
-                if "loss" in k:
-                    total_loss += v
-                    self._log(f"{episode},{v.item()},{k}\n")
-            self._flush_logs()
-            
-            print(f"Loss: {total_loss.item()}")
-            total_loss.backward()
-            
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            
-            if episode % save_interval == 0:
-                # Save the model
-                torch.save({
-                    "actor_state_dict": self.actor.state_dict(),
-                    "critic_state_dict": self.critic.state_dict(),
-                }, f"./runs/previous/{salted_model_name}/model_{episode}.pth")
+            for epoch in range(epochs_per_episode):
+                self.advantage(data)
+                        
+                total_loss = 0
+                loss = self.loss_fn(data)
+                for k, v in loss.items():
+                    if "loss" in k:
+                        total_loss += v
+                self._flush_logs()
                 
-                # Save the latest model
-                torch.save({
-                    "actor_state_dict": self.actor.state_dict(),
-                    "critic_state_dict": self.critic.state_dict(),
-                }, f"./runs/latest/model.pth")
+                print(f"Episode: {episode + 1}/{episodes} Epoch: {epoch + 1}/{epochs_per_episode} Loss: {total_loss.item()}")
+                self._log(f"{episode + 1},{epoch + 1},{data['next']['reward'].mean().item()},{total_loss.item()}\n")
+                total_loss.backward()
+                
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+                if episode % save_interval == 0:
+                    # Save the model
+                    torch.save({
+                        "actor_state_dict": self.actor.state_dict(),
+                        "critic_state_dict": self.critic.state_dict(),
+                    }, f"./runs/previous/{salted_model_name}/model_{episode}.pth")
+                    
+                    # Save the latest model
+                    torch.save({
+                        "actor_state_dict": self.actor.state_dict(),
+                        "critic_state_dict": self.critic.state_dict(),
+                    }, f"./runs/latest/model.pth")
+                
+            scheduler.step()
                 
         self._close_logs()
             

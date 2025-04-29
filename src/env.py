@@ -1,0 +1,514 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from __future__ import annotations
+
+import importlib.util
+import io
+import pathlib
+from typing import Dict
+
+import torch
+from tensordict import TensorDict, TensorDictBase
+from torchrl.data import Binary, Bounded, Categorical, Composite, NonTensor, Unbounded
+
+from torchrl.envs import EnvBase
+from torchrl.envs.common import _EnvPostInit
+
+from torchrl.envs.utils import _classproperty
+from chess import Move
+
+
+class _ChessMeta(_EnvPostInit):
+    def __call__(cls, *args, **kwargs):
+        instance = super().__call__(*args, **kwargs)
+        if kwargs.get("include_hash"):
+            from torchrl.envs import Hash
+
+            in_keys = []
+            out_keys = []
+            if instance.include_san:
+                in_keys.append("san")
+                out_keys.append("san_hash")
+            if instance.include_fen:
+                in_keys.append("fen")
+                out_keys.append("fen_hash")
+            if instance.include_pgn:
+                in_keys.append("pgn")
+                out_keys.append("pgn_hash")
+            instance = instance.append_transform(Hash(in_keys, out_keys))
+        if kwargs.get("mask_actions", True):
+            from torchrl.envs import ActionMask
+
+            instance = instance.append_transform(ActionMask())
+        return instance
+
+
+class ChessEnv(EnvBase, metaclass=_ChessMeta):
+    _hash_table: Dict[int, str] = {}
+    _PGN_RESTART = """[Event "?"]
+[Site "?"]
+[Date "????.??.??"]
+[Round "?"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+
+*"""
+
+    @_classproperty
+    def lib(cls):
+        try:
+            import chess
+            import chess.pgn
+        except ImportError:
+            raise ImportError(
+                "The `chess` library could not be found. Make sure you installed it through `pip install chess`."
+            )
+        return chess
+
+    _san_moves = []
+
+    @_classproperty
+    def san_moves(cls):
+        if not cls._san_moves:
+            with open(pathlib.Path(__file__).parent / "san_moves.txt", "r+") as f:
+                cls._san_moves.extend(f.read().split("\n"))
+        return cls._san_moves
+
+    def _legal_moves_to_index(
+        self,
+        tensordict: TensorDictBase | None = None,
+        board: "chess.Board" | None = None,  # noqa: F821
+        return_mask: bool = False,
+        pad: bool = False,
+    ) -> torch.Tensor:
+        if not self.stateful:
+            if tensordict is None:
+                # trust the board
+                pass
+            elif self.include_fen:
+                fen = tensordict.get("fen", None)
+                fen = fen.data
+                self.board.set_fen(fen)
+                board = self.board
+            elif self.include_pgn:
+                pgn = tensordict.get("pgn")
+                pgn = pgn.data
+                board = self._pgn_to_board(pgn, self.board)
+
+        if board is None:
+            board = self.board
+
+        indices = torch.tensor(
+            [self._san_moves.index(board.san(m)) for m in board.legal_moves],
+            dtype=torch.int64,
+        )
+        mask = None
+        if return_mask:
+            mask = self._move_index_to_mask(indices)
+        if pad:
+            indices = torch.nn.functional.pad(
+                indices, [0, 218 - indices.numel() + 1], value=len(self.san_moves)
+            )
+        if return_mask:
+            return indices, mask
+        return indices
+
+    @classmethod
+    def _move_index_to_mask(cls, indices: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(len(cls.san_moves), dtype=torch.bool).index_fill_(
+            0, indices, True
+        )
+
+    def __init__(
+        self,
+        *,
+        stateful: bool = True,
+        include_san: bool = False,
+        include_fen: bool = False,
+        include_pgn: bool = False,
+        include_legal_moves: bool = False,
+        include_hash: bool = False,
+        mask_actions: bool = True,
+        pixels: bool = False,
+    ):
+        chess = self.lib
+        super().__init__()
+        self.full_observation_spec = Composite(
+            turn=Categorical(n=2, dtype=torch.bool, shape=()),
+        )
+        self.include_san = include_san
+        self.include_fen = include_fen
+        self.include_pgn = include_pgn
+        self.mask_actions = mask_actions
+        self.include_legal_moves = include_legal_moves
+        if include_legal_moves:
+            # 218 max possible legal moves per chess board position
+            # https://www.stmintz.com/ccc/index.php?id=424966
+            # len(self.san_moves)+1 is the padding value
+            self.full_observation_spec["legal_moves"] = Bounded(
+                0, 1 + len(self.san_moves), shape=(218,), dtype=torch.int64
+            )
+        if include_san:
+            self.full_observation_spec["san"] = NonTensor(shape=(), example_data="Nc6")
+        if include_pgn:
+            self.full_observation_spec["pgn"] = NonTensor(
+                shape=(), example_data=self._PGN_RESTART
+            )
+        if include_fen:
+            self.full_observation_spec["fen"] = NonTensor(shape=(), example_data="any")
+        if not stateful and not (include_pgn or include_fen):
+            raise RuntimeError(
+                "At least one state representation (pgn or fen) must be enabled when stateful "
+                f"is {stateful}."
+            )
+
+        self.stateful = stateful
+
+        # state_spec is loosely defined as such - it's not really an issue that extra keys
+        # can go missing but it allows us to reset the env using fen passed to the reset
+        # method.
+        self.full_state_spec = self.full_observation_spec.clone()
+
+        self.pixels = pixels
+        if pixels:
+            if importlib.util.find_spec("cairosvg") is None:
+                raise ImportError(
+                    "Please install cairosvg to use this environment with pixel rendering."
+                )
+            if importlib.util.find_spec("torchvision") is None:
+                raise ImportError(
+                    "Please install torchvision to use this environment with pixel rendering."
+                )
+            self.full_observation_spec["pixels"] = Unbounded(
+                shape=(3, 390, 390), dtype=torch.uint8
+            )
+
+        self.full_action_spec = Composite(
+            action=Categorical(n=len(self.san_moves), shape=(), dtype=torch.int64)
+        )
+        self.full_reward_spec = Composite(
+            reward=Unbounded(shape=(1,), dtype=torch.float32)
+        )
+        if self.mask_actions:
+            self.full_observation_spec["action_mask"] = Binary(
+                n=len(self.san_moves), dtype=torch.bool
+            )
+
+        # done spec generated automatically
+        self.board = chess.Board()
+        if self.stateful:
+            self.action_spec.set_provisional_n(len(list(self.board.legal_moves)))
+
+    def _is_done(self, board):
+        return board.is_game_over() | board.is_fifty_moves()
+
+    def _reset(self, tensordict=None):
+        fen = None
+        pgn = None
+        if tensordict is not None:
+            dest = tensordict.empty()
+            if self.include_fen:
+                fen = tensordict.get("fen", None)
+                if fen is not None:
+                    fen = fen.data
+            elif self.include_pgn:
+                pgn = tensordict.get("pgn", None)
+                if pgn is not None:
+                    pgn = pgn.data
+        else:
+            dest = TensorDict()
+
+        if fen is None and pgn is None:
+            self.board.reset()
+        elif fen is not None:
+            self.board.set_fen(fen)
+            if self._is_done(self.board):
+                raise ValueError(
+                    "Cannot reset to a fen that is a gameover state." f" fen: {fen}"
+                )
+        elif pgn is not None:
+            self.board = self._pgn_to_board(pgn)
+
+        if self.include_fen and fen is None:
+            fen = self.board.fen()
+        if self.include_pgn and pgn is None:
+            pgn = self._board_to_pgn(self.board)
+
+        turn = self.board.turn
+        if self.include_san:
+            if self.board.move_stack:
+                move = self.board.peek()
+            else:
+                move = None
+            if move is None:
+                dest.set("san", "<start>")
+            else:
+                dest.set("san", self.board.san(move))
+        if self.include_fen:
+            dest.set("fen", fen)
+        if self.include_pgn:
+            dest.set("pgn", pgn)
+        dest.set("turn", turn)
+        if self.include_legal_moves:
+            moves_idx = self._legal_moves_to_index(
+                board=self.board, pad=True, return_mask=self.mask_actions
+            )
+            if self.mask_actions:
+                moves_idx, mask = moves_idx
+                dest.set("action_mask", mask)
+            dest.set("legal_moves", moves_idx)
+        elif self.mask_actions:
+            dest.set(
+                "action_mask",
+                self._legal_moves_to_index(
+                    board=self.board, pad=True, return_mask=True
+                )[1],
+            )
+
+        if self.pixels:
+            dest.set("pixels", self._get_tensor_image(board=self.board))
+        return dest
+
+    _cairosvg_lib = None
+
+    @_classproperty
+    def _cairosvg(cls):
+        csvg = cls._cairosvg_lib
+        if csvg is None:
+            import cairosvg
+
+            csvg = cls._cairosvg_lib = cairosvg
+        return csvg
+
+    _torchvision_lib = None
+
+    @_classproperty
+    def _torchvision(cls):
+        tv = cls._torchvision_lib
+        if tv is None:
+            import torchvision
+
+            tv = cls._torchvision_lib = torchvision
+        return tv
+
+    @classmethod
+    def _get_tensor_image(cls, board):
+        try:
+            from PIL import Image
+
+            svg = board._repr_svg_()
+            # Convert SVG to PNG using cairosvg
+            png_data = io.BytesIO()
+            cls._cairosvg.svg2png(bytestring=svg.encode("utf-8"), write_to=png_data)
+            png_data.seek(0)
+            # Open the PNG image using Pillow
+            img = Image.open(png_data)
+            img = cls._torchvision.transforms.functional.pil_to_tensor(img)
+        except ImportError:
+            raise ImportError(
+                "Chess rendering requires cairosvg, PIL and torchvision to be installed."
+            )
+        return img
+
+    @classmethod
+    def _pgn_to_board(
+        cls, pgn_string: str, board: "chess.Board" | None = None  # noqa: F821
+    ) -> "chess.Board":  # noqa: F821
+        pgn_io = io.StringIO(pgn_string)
+        game = cls.lib.pgn.read_game(pgn_io)
+        if board is None:
+            board = cls.lib.Board()
+        else:
+            board.reset()
+        for move in game.mainline_moves():
+            board.push(move)
+        return board
+
+    @classmethod
+    def _add_move_to_pgn(cls, pgn_string: str, move: "chess.Move") -> str:  # noqa: F821
+        pgn_io = io.StringIO(pgn_string)
+        game = cls.lib.pgn.read_game(pgn_io)
+        if game is None:
+            raise ValueError("Invalid PGN string")
+        game.end().add_variation(move)
+        return str(game)
+
+    @classmethod
+    def _board_to_pgn(cls, board: "chess.Board") -> str:  # noqa: F821
+        game = cls.lib.pgn.Game.from_board(board)
+        pgn_string = str(game)
+        return pgn_string
+
+    def get_legal_moves(self, tensordict=None, uci=False):
+        """List the legal moves in a position.
+
+        To choose one of the actions, the "action" key can be set to the index
+        of the move in this list.
+
+        Args:
+            tensordict (TensorDict, optional): Tensordict containing the fen
+                string of a position. Required if not stateful. If stateful,
+                this argument is ignored and the current state of the env is
+                used instead.
+
+            uci (bool, optional): If ``False``, moves are given in SAN format.
+                If ``True``, moves are given in UCI format. Default is
+                ``False``.
+
+        """
+        board = self.board
+        if not self.stateful:
+            if tensordict is None:
+                raise ValueError(
+                    "tensordict must be given since this env is not stateful"
+                )
+            fen = tensordict.get("fen").data
+            board.set_fen(fen)
+        moves = board.legal_moves
+
+        if uci:
+            return [board.uci(move) for move in moves]
+        else:
+            return [board.san(move) for move in moves]
+
+    def _step(self, tensordict):
+        # action
+        action = tensordict.get("action")
+        board = self.board
+
+        pgn = None
+        fen = None
+        if not self.stateful:
+            if self.include_fen:
+                fen = tensordict.get("fen").data
+                board.set_fen(fen)
+            elif self.include_pgn:
+                pgn = tensordict.get("pgn").data
+                board = self._pgn_to_board(pgn, board)
+            else:
+                raise RuntimeError(
+                    "Not enough information to deduce the board. If stateful=False, include_pgn or include_fen must be True."
+                )
+                
+
+        san = self.san_moves[action]
+        """
+        Really solid at capturing
+        REWARDS = {
+            "BASE": -0.005,
+            "CAPTURE": 0.3,
+            "GIVE_CHECK": 0.6,
+            "NEW_MOVE": 0.1,
+            "REPEATED_MOVE": -0.01,
+            "CHECKMATE": 1,
+            "LOSS": -1,
+        }
+        """
+        
+        
+        REWARDS = {
+            "BASE": -0.005,
+            "NEW_MOVE": 0.2,
+            "REPEATED_MOVE": -0.03,
+            "CAPTURE": 0.09, 
+            "CAPTURED": 0.02,
+            "GIVE_CHECK": 0.5,
+            "CHECKMATE": 1,
+            "LOSS": -1,
+            "PLAYER_PROMOTION": -0.01,
+        }
+        
+        # Reward calculation
+        reward_val = REWARDS["BASE"]
+        uci = board.parse_san(san)
+        agent_moves = [m for i, m in enumerate(board.move_stack) if (self.lib.WHITE if i % 2 == 0 else self.lib.BLACK) == board.turn]
+        player_move = board.peek() if len(board.move_stack) > 0 else None
+        
+        if player_move:
+            if board.is_capture(player_move):
+                piece = board.piece_at(player_move.to_square)
+                if piece is not None:
+                    piece_value = piece.piece_type
+                    reward_val -= REWARDS["CAPTURED"] * abs(piece_value)
+                
+            if player_move.promotion:
+                reward_val -= REWARDS["PLAYER_PROMOTION"]
+        
+        if uci not in agent_moves:
+            reward_val += REWARDS["NEW_MOVE"]
+        elif not board.is_capture(uci):
+            reward_val -= REWARDS["REPEATED_MOVE"]
+            
+        if board.is_capture(uci):
+            # get value of the piece captured
+            piece = board.piece_at(uci.to_square)
+            if piece is not None:
+                piece_value = piece.piece_type
+                reward_val += REWARDS["CAPTURE"] * abs(piece_value)
+                
+        if board.gives_check(uci):
+            reward_val += REWARDS["GIVE_CHECK"]
+            
+        if board.is_checkmate():
+            print("Checkmate!")
+            reward_val += REWARDS["CHECKMATE"]
+            
+        board.push_san(san)
+        
+        if board.is_checkmate() or board.is_stalemate():
+            reward_val = REWARDS["LOSS"]
+
+        dest = tensordict.empty()
+
+        # Collect data
+        if self.include_fen:
+            fen = board.fen()
+            dest.set("fen", fen)
+
+        if self.include_pgn:
+            if pgn is not None:
+                pgn = self._add_move_to_pgn(pgn, board.move_stack[-1])
+            else:
+                pgn = self._board_to_pgn(board)
+            dest.set("pgn", pgn)
+
+        if self.include_san:
+            dest.set("san", san)
+
+        if self.include_legal_moves:
+            moves_idx = self._legal_moves_to_index(
+                board=board, pad=True, return_mask=self.mask_actions
+            )
+            if self.mask_actions:
+                moves_idx, mask = moves_idx
+                dest.set("action_mask", mask)
+            dest.set("legal_moves", moves_idx)
+        elif self.mask_actions:
+            dest.set(
+                "action_mask",
+                self._legal_moves_to_index(
+                    board=self.board, pad=True, return_mask=True
+                )[1],
+            )
+
+        turn = torch.tensor(board.turn)
+        done = self._is_done(board)
+
+        reward = torch.tensor([reward_val], dtype=torch.float32)
+        dest.set("reward", reward)
+        dest.set("turn", turn)
+        dest.set("done", [done])
+        dest.set("terminated", [done])
+        if self.pixels:
+            dest.set("pixels", self._get_tensor_image(board=self.board))
+        return dest
+
+    def _set_seed(self, *args, **kwargs):
+        ...
+
+    def cardinality(self, tensordict: TensorDictBase | None = None) -> int:
+        self._set_action_space(tensordict)
+        return self.action_spec.cardinality()
