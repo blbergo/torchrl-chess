@@ -23,17 +23,17 @@ class Model():
         self.log_files = []
         
         self.env = ChessEnv(include_legal_moves=True, include_hash=True, include_fen=True)
-        n_obs = self.env.observation_spec["legal_moves"].shape[0]
+        n_obs = self.env.observation_spec["fen_hash"].shape[0]
     
         n_actions = self.env.action_spec.n
         
         print(f"observation shape: {n_obs}, action space: {n_actions}")
-
+        
         actor_net = ChessActor(n_obs, n_actions)
 
         actor_mod = TensorDictModule(
             module=actor_net,
-            in_keys=["legal_moves"],
+            in_keys=["fen_hash"],
             out_keys=["logits"],
         )
 
@@ -52,7 +52,7 @@ class Model():
 
         self.critic = ValueOperator(
             module=critic_net,
-            in_keys=["legal_moves"],
+            in_keys=["fen_hash"],
             out_keys=["state_value"],
         )
 

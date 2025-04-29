@@ -395,39 +395,71 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
                 
 
         san = self.san_moves[action]
+        """
+        Really solid at capturing
+        REWARDS = {
+            "BASE": -0.005,
+            "CAPTURE": 0.3,
+            "GIVE_CHECK": 0.6,
+            "NEW_MOVE": 0.1,
+            "REPEATED_MOVE": -0.01,
+            "CHECKMATE": 1,
+            "LOSS": -1,
+        }
+        """
+        
+        
+        REWARDS = {
+            "BASE": -0.005,
+            "NEW_MOVE": 0.2,
+            "REPEATED_MOVE": -0.03,
+            "CAPTURE": 0.09, 
+            "CAPTURED": 0.02,
+            "GIVE_CHECK": 0.5,
+            "CHECKMATE": 1,
+            "LOSS": -1,
+            "PLAYER_PROMOTION": -0.01,
+        }
         
         # Reward calculation
-        reward_val = 0
+        reward_val = REWARDS["BASE"]
         uci = board.parse_san(san)
+        agent_moves = [m for i, m in enumerate(board.move_stack) if (self.lib.WHITE if i % 2 == 0 else self.lib.BLACK) == board.turn]
+        player_move = board.peek() if len(board.move_stack) > 0 else None
         
-        if uci not in board.move_stack:
-            reward_val += 0.1
+        if player_move:
+            if board.is_capture(player_move):
+                piece = board.piece_at(player_move.to_square)
+                if piece is not None:
+                    piece_value = piece.piece_type
+                    reward_val -= REWARDS["CAPTURED"] * abs(piece_value)
+                
+            if player_move.promotion:
+                reward_val -= REWARDS["PLAYER_PROMOTION"]
+        
+        if uci not in agent_moves:
+            reward_val += REWARDS["NEW_MOVE"]
+        elif not board.is_capture(uci):
+            reward_val -= REWARDS["REPEATED_MOVE"]
             
         if board.is_capture(uci):
-            # get the value of the piece captured
-            piece = board.piece_type_at(uci.to_square)
+            # get value of the piece captured
+            piece = board.piece_at(uci.to_square)
             if piece is not None:
-                if piece == 1:
-                    reward_val += 0.5
-                elif piece == 2:
-                    reward_val += 0.3
-                elif piece == 3:
-                    reward_val += 0.3
-                elif piece == 4:
-                    reward_val += 0.2
-                elif piece == 5:
-                    reward_val += 0.1
-                else:
-                    reward_val += 0.2
-        
-        if (len(board.move_stack) == 49 and not board.is_checkmate()) or board.is_stalemate():
-            reward_val = -1   
-    
+                piece_value = piece.piece_type
+                reward_val += REWARDS["CAPTURE"] * abs(piece_value)
+                
+        if board.gives_check(uci):
+            reward_val += REWARDS["GIVE_CHECK"]
+            
+        if board.is_checkmate():
+            print("Checkmate!")
+            reward_val += REWARDS["CHECKMATE"]
+            
         board.push_san(san)
         
-        if board.is_checkmate():
-            print(f"Checkmate! {board.fen()}")
-            reward_val = 1
+        if board.is_checkmate() or board.is_stalemate():
+            reward_val = REWARDS["LOSS"]
 
         dest = tensordict.empty()
 
@@ -464,11 +496,6 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
 
         turn = torch.tensor(board.turn)
         done = self._is_done(board)
-  
-        if board.is_checkmate():
-            # turn flips after every move, even if the game is over
-            # winner = not turn
-            reward_val = 1  # if winner == self.lib.WHITE else 0
 
         reward = torch.tensor([reward_val], dtype=torch.float32)
         dest.set("reward", reward)

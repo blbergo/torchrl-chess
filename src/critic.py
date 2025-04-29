@@ -3,7 +3,7 @@ from torch import nn
 class ChessCritic(nn.Module):
     def __init__(self, n_obs):
         super(ChessCritic, self).__init__()
-        self.fc1 = nn.Linear(n_obs + 1, 128)
+        self.fc1 = nn.Linear(n_obs, 128)
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, 1)
         self.relu = nn.ReLU()
