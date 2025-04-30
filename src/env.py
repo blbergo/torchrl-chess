@@ -166,6 +166,9 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
             )
 
         self.stateful = stateful
+        
+        self.game_count = 0
+        self.logger = None
 
         # state_spec is loosely defined as such - it's not really an issue that extra keys
         # can go missing but it allows us to reset the env using fen passed to the reset
@@ -206,6 +209,10 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
         return board.is_game_over() | board.is_fifty_moves()
 
     def _reset(self, tensordict=None):
+        if self.game_count == 0:
+            self.logger = open("./runs/latest/games.csv", "w")
+            self.logger.write("game,outcome,agent_won")
+        
         fen = None
         pgn = None
         if tensordict is not None:
@@ -374,7 +381,7 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
         else:
             return [board.san(move) for move in moves]
 
-    def _step(self, tensordict):
+    def _step(self, tensordict):      
         # action
         action = tensordict.get("action")
         board = self.board
@@ -414,10 +421,11 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
             "NEW_MOVE": 0.2,
             "CHECKMATE": 1,
             "LOSS": -1,
-            "REPEATED_MOVE": -0.011,
+            "REPEATED_MOVE": -0.1,
             "CHECK": 0.4,
-            "CAPTURE": 0.05, 
-            "CAPUTRE_REWARD_DECAY": 1,
+            "CHECK_BIAS": 1,
+            "CAPTURE": 0.9, # base capture reward
+            "CAPUTRE_BIAS": 1, # how long captures are rewarded for
             "CAPTURED": 0.05,
             "PLAYER_PROMOTION": -0.01,
         }
@@ -437,11 +445,14 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
         if board.is_capture(current_move):
             captured_piece = board.piece_at(current_move.to_square)
             if captured_piece:
-                capture_reward_decay = REWARDS["CAPUTRE_REWARD_DECAY"] / len(board.move_stack)
-                reward_val += REWARDS["CAPTURE"] * abs(captured_piece.piece_type) + capture_reward_decay
+                #capture_reward_decay = REWARDS["CAPUTRE_BIAS"] / len(board.move_stack)
+                reward_val += REWARDS["CAPTURE"] * abs(captured_piece.piece_type) #* capture_reward_decay
             
-        #if board.gives_check(current_move):
-         #   reward_val += REWARDS["CHECK"]
+            """
+        if board.gives_check(current_move):
+            move_count = len(board.move_stack)
+            reward_val += REWARDS["CHECK"] 
+            """
                
         board.push_san(san)
         
@@ -454,7 +465,9 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
             else:
                 reward_val -= REWARDS["LOSS"]
             
-            print(f"Outcome: {outcome.termination.name}, Agent Won: {agent_won}")
+            self.logger.write(f"\n{self.game_count + 1},{outcome.termination.name},{agent_won}")
+            self.logger.flush()
+            self.game_count += 1
         
         dest = tensordict.empty()
 
