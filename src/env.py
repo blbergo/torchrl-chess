@@ -412,55 +412,50 @@ class ChessEnv(EnvBase, metaclass=_ChessMeta):
         REWARDS = {
             "BASE": -0.005,
             "NEW_MOVE": 0.2,
-            "REPEATED_MOVE": -0.03,
-            "CAPTURE": 0.09, 
-            "CAPTURED": 0.02,
-            "GIVE_CHECK": 0.5,
             "CHECKMATE": 1,
             "LOSS": -1,
+            "REPEATED_MOVE": -0.011,
+            "CHECK": 0.4,
+            "CAPTURE": 0.05, 
+            "CAPUTRE_REWARD_DECAY": 1,
+            "CAPTURED": 0.05,
             "PLAYER_PROMOTION": -0.01,
         }
         
         # Reward calculation
         reward_val = REWARDS["BASE"]
-        uci = board.parse_san(san)
+        current_move = board.parse_san(san)
         agent_moves = [m for i, m in enumerate(board.move_stack) if (self.lib.WHITE if i % 2 == 0 else self.lib.BLACK) == board.turn]
         player_move = board.peek() if len(board.move_stack) > 0 else None
         
-        if player_move:
-            if board.is_capture(player_move):
-                piece = board.piece_at(player_move.to_square)
-                if piece is not None:
-                    piece_value = piece.piece_type
-                    reward_val -= REWARDS["CAPTURED"] * abs(piece_value)
-                
-            if player_move.promotion:
-                reward_val -= REWARDS["PLAYER_PROMOTION"]
-        
-        if uci not in agent_moves:
+        if current_move not in agent_moves:
             reward_val += REWARDS["NEW_MOVE"]
-        elif not board.is_capture(uci):
-            reward_val -= REWARDS["REPEATED_MOVE"]
+        elif not board.is_capture(current_move):
+            repeated_move_count = board.move_stack.count(current_move)
+            reward_val -= REWARDS["REPEATED_MOVE"] * repeated_move_count
             
-        if board.is_capture(uci):
-            # get value of the piece captured
-            piece = board.piece_at(uci.to_square)
-            if piece is not None:
-                piece_value = piece.piece_type
-                reward_val += REWARDS["CAPTURE"] * abs(piece_value)
-                
-        if board.gives_check(uci):
-            reward_val += REWARDS["GIVE_CHECK"]
+        if board.is_capture(current_move):
+            captured_piece = board.piece_at(current_move.to_square)
+            if captured_piece:
+                capture_reward_decay = REWARDS["CAPUTRE_REWARD_DECAY"] / len(board.move_stack)
+                reward_val += REWARDS["CAPTURE"] * abs(captured_piece.piece_type) + capture_reward_decay
             
-        if board.is_checkmate():
-            print("Checkmate!")
-            reward_val += REWARDS["CHECKMATE"]
-            
+        #if board.gives_check(current_move):
+         #   reward_val += REWARDS["CHECK"]
+               
         board.push_san(san)
         
-        if board.is_checkmate() or board.is_stalemate():
-            reward_val = REWARDS["LOSS"]
-
+        if board.is_game_over():
+            outcome = board.outcome()
+            agent_won = outcome.winner is not None and outcome.winner is not board.turn
+            
+            if agent_won:
+                reward_val += REWARDS["CHECKMATE"]
+            else:
+                reward_val -= REWARDS["LOSS"]
+            
+            print(f"Outcome: {outcome.termination.name}, Agent Won: {agent_won}")
+        
         dest = tensordict.empty()
 
         # Collect data
