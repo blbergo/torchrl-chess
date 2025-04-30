@@ -2161,6 +2161,18 @@ pure-eval = "*"
 tests = ["cython", "littleutils", "pygments", "pytest", "typeguard"]
 
 [[package]]
+name = "stockfish"
+version = "3.28.0"
+description = "Wraps the open-source Stockfish chess engine for easy integration into python."
+optional = false
+python-versions = ">=3.7"
+groups = ["main"]
+files = [
+    {file = "stockfish-3.28.0-py3-none-any.whl", hash = "sha256:e432e57112448fe1271dff402db3a4747bf00d1721815ce0a36cfa26582cf360"},
+    {file = "stockfish-3.28.0.tar.gz", hash = "sha256:8764127c00434aa85b7fca1c064800e7ea907bb3626ccd4b583f0e911b014070"},
+]
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 description = "Computer algebra system (CAS) in Python"
@@ -2515,4 +2527,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<4.0"
-content-hash = "88f75ef93b7faeea7c6f3b7cf8e07ff159543062892e5fd8fbd1dff816beca65"
+content-hash = "d76c107a065fd2210abbb174965d9afd627eb3aa126f3b912c684ef21c6219bd"
