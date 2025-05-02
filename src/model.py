@@ -178,12 +178,12 @@ class Model():
         self._close_logs()
             
 
-    def load(self, path: str):
+    def load(self, path: str, device = None):
         if not os.path.exists(path):
             print(f"Model file {path} does not exist.")
             return
 
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, map_location=device)
         self.actor.load_state_dict(checkpoint["actor_state_dict"])
         self.critic.load_state_dict(checkpoint["critic_state_dict"])
         print(f"Model loaded from {path}")
